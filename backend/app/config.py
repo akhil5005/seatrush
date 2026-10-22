@@ -23,6 +23,12 @@ DATABASE_URL = os.getenv(
     "postgresql://seatrush:seatrush@localhost:5432/seatrush",
 )
 
+# Max asyncpg connections per process. Raised by the test suite so that the
+# 50-concurrent-holds test contends on Postgres row locks (what we want to
+# prove) rather than on a 10-slot connection pool (which would serialise it
+# before it ever reached the database).
+DB_POOL_MAX = _int_env("DB_POOL_MAX", 10)
+
 # DEV-ONLY secret. In production this comes from the platform's secret store.
 # The load test deliberately re-uses it to mint tokens locally (see loadtest/).
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-insecure-jwt-secret-change-me")

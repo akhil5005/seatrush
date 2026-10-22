@@ -23,7 +23,10 @@ async def connect() -> asyncpg.Pool:
     _pool = await asyncpg.create_pool(
         dsn=config.DATABASE_URL,
         min_size=2,
-        max_size=10,
+        # 3 replicas x 10 = 30 Postgres backends, comfortable for one node.
+        # The concurrency test raises this so that 50 hold attempts really do
+        # contend inside Postgres rather than queueing on pool acquisition.
+        max_size=config.DB_POOL_MAX,
         # Postgres would happily keep a connection forever; recycling bounds the
         # damage from a leaked/stuck session.
         max_inactive_connection_lifetime=300,

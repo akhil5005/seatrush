@@ -38,8 +38,15 @@ app = FastAPI(
     # the React build and proxies /api from the SAME origin. Same-origin means
     # no preflight requests, no CORS config to get wrong, and no credentials
     # leaking to a third origin.
+    # EVERY route, including FastAPI's own, must live under /api or it is
+    # unreachable through the gateway: nginx.conf only proxies /api/ and sends
+    # everything else to the React SPA's try_files fallback.
+    # The defaults put /redoc and /docs/oauth2-redirect at the root, which
+    # tests/test_edge_contract.py::test_api_prefix_is_never_stripped catches.
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
+    redoc_url=None,
+    swagger_ui_oauth2_redirect_url="/api/docs/oauth2-redirect",
 )
 
 

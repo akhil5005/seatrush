@@ -131,6 +131,17 @@ async def claim(con: asyncpg.Connection, user_id: int, key: str,
         raise ApiError(422, "idempotency_mismatch",
                        "This Idempotency-Key was already used for a different request")
 
+    # NOTE ON jsonb AND KEY ORDER
+    #   response_body is jsonb, which stores a parsed binary form -- so Postgres
+    #   does NOT preserve the original key order (it sorts by key length, then
+    #   alphabetically) and drops insignificant whitespace. The replayed
+    #   response is therefore semantically identical but not byte-identical to
+    #   the original, which is why the test asserts deep equality on parsed
+    #   JSON rather than comparing strings. JSON object key order carries no
+    #   meaning, so no client can legitimately depend on it.
+    #   (If byte-exact replay were a requirement -- e.g. to re-sign a webhook
+    #   payload -- the column would have to be `json` or plain `text`, which
+    #   preserve the input verbatim at the cost of being slower to query.)
     if row["status_code"] is None or row["response_body"] is None:
         # Also unreachable: the response is written in the same transaction
         # that inserted the key, so a visible row always has a body.

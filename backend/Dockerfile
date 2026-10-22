@@ -12,7 +12,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# Tests and their config ship in the image so they can be run against the
+# compose Postgres with:  docker compose run --rm --no-deps api1 pytest
 COPY tests ./tests
+COPY pytest.ini .
 
 EXPOSE 8000
 
