@@ -1,0 +1,21 @@
+# Dependencies / build output
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Generated TLS material -- never commit a private key, even a dev one.
+nginx/certs/
+*.pem
+*.key
+*.crt
+
+# Local env overrides
+.env
+.env.local
+
+# Captured run output used to fill in docs/interview-guide.html
+runs/

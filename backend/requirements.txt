@@ -1,0 +1,11 @@
+# Pinned on purpose: a demo that rebuilds months later must behave identically.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+asyncpg==0.30.0
+PyJWT==2.10.1
+httpx==0.28.1
+pydantic==2.10.4
+
+# Test-only (kept in one file to keep the image/build simple for a demo project).
+pytest==8.3.4
+pytest-asyncio==0.25.0

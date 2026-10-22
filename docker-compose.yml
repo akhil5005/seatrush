@@ -1,0 +1,192 @@
+# ===========================================================================
+#  SeatRush -- Plan A (primary, used in the live demo)
+#
+#      docker compose up --build
+#      ->  https://localhost:8443    (accept the self-signed certificate)
+#          http://localhost:8080     (301 redirects to the line above)
+#
+#  Start-up order is enforced by health/completion conditions, not by sleeps:
+#      postgres (healthy) -> migrate (exits 0) -> api1/api2/api3 -> nginx
+#
+#  Only Nginx publishes ports. Postgres and the API replicas are reachable only
+#  on the private `seatrush` bridge network, which is the point of having a
+#  single gateway: there is exactly one door into the system.
+# ===========================================================================
+
+name: seatrush
+
+# ---------------------------------------------------------------------------
+# Shared definition for the three identical API replicas. They differ ONLY by
+# INSTANCE_NAME -- same image, same code, same config. That interchangeability
+# is what lets Nginx round-robin them without sticky sessions.
+# ---------------------------------------------------------------------------
+x-api-common: &api-common
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  environment: &api-env
+    DATABASE_URL: postgresql://seatrush:seatrush@postgres:5432/seatrush
+    # DEV-ONLY secret, shared by all replicas so any of them can verify a JWT
+    # minted by any other. In production this comes from a secret store.
+    JWT_SECRET: dev-only-insecure-jwt-secret-change-me
+    HOLD_SECONDS: "300"
+    MAX_SEATS_PER_HOLD: "6"
+    # Who to probe for GET /api/ops/cluster. Open-source Nginx has no active
+    # health checks, so the app does the probing itself.
+    PEERS: http://api1:8000,http://api2:8000,http://api3:8000
+    NGINX_ACCESS_LOG: /var/log/nginx/access.json.log
+  volumes:
+    # READ-ONLY view of Nginx's log volume so GET /api/ops/logs can tail it.
+    # `:ro` matters: exactly one writer (Nginx) means no locking and no chance
+    # of an API process corrupting the log it is reading.
+    - nginx_logs:/var/log/nginx:ro
+  depends_on:
+    migrate:
+      # Do not start until the schema exists. Without this the first replica to
+      # boot would race the migration and crash on a missing table.
+      condition: service_completed_successfully
+  networks: [seatrush]
+  # Container names are prefixed (seatrush-api2, not api2) so this stack can
+  # coexist with other compose projects on the same machine without a
+  # "container name already in use" clash. Stop a replica with either:
+  #     docker compose stop api2          (service name -- preferred)
+  #     docker stop seatrush-api2         (container name)
+  #
+  # *** NO `restart:` POLICY ON THE API SERVICES, ON PURPOSE. ***
+  # The failover demo is `docker stop api2`, and a restart policy would bring
+  # it straight back and silently undo the demo. Compose's default (`no`) is
+  # what we want here. Production would use `unless-stopped`.
+
+services:
+  # -----------------------------------------------------------------------
+  postgres:
+    # Pinned major: the row-locking and transaction behaviour this project
+    # demonstrates is version-sensitive, and an unpinned tag could move to 17
+    # under us between now and the interview.
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: seatrush
+      POSTGRES_PASSWORD: seatrush      # DEV-ONLY
+      POSTGRES_DB: seatrush
+      # Slightly faster initdb; irrelevant to correctness.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    # pg_isready is the real readiness signal. A container that is "running" is
+    # not the same as a Postgres that is accepting connections -- the entrypoint
+    # starts the server, shuts it down to run init scripts, and starts it again.
+    # Polling the socket is the only honest check.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seatrush -d seatrush"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks: [seatrush]
+    # Deliberately NOT published. Uncomment for psql debugging from the host;
+    # 5433 avoids clashing with a locally installed Postgres on 5432.
+    # ports:
+    #   - "5433:5432"
+
+  # -----------------------------------------------------------------------
+  # One-shot schema + fixtures, then exits 0. Same image as the API, so there
+  # is no second Dockerfile to keep in sync and the SQL it applies is the exact
+  # file the app ships.
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.seed", "--migrate", "--loadtest-users", "300"]
+    environment:
+      <<: *api-env
+      INSTANCE_NAME: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [seatrush]
+
+  # -----------------------------------------------------------------------
+  api1:
+    <<: *api-common
+    container_name: seatrush-api1
+    environment:
+      <<: *api-env
+      INSTANCE_NAME: api1
+
+  api2:
+    <<: *api-common
+    container_name: seatrush-api2
+    environment:
+      <<: *api-env
+      INSTANCE_NAME: api2
+
+  api3:
+    <<: *api-common
+    container_name: seatrush-api3
+    environment:
+      <<: *api-env
+      INSTANCE_NAME: api3
+
+  # -----------------------------------------------------------------------
+  nginx:
+    build:
+      # Context is the repo root, not ./nginx, because the image's first stage
+      # has to build the React app from ./frontend.
+      context: .
+      dockerfile: nginx/Dockerfile
+    container_name: seatrush-nginx
+    ports:
+      - "8080:80"     # plain HTTP -> 301 to HTTPS
+      - "8443:443"    # the real entry point
+    volumes:
+      - nginx_logs:/var/log/nginx       # read-write: Nginx is the only writer
+      - nginx_cache:/var/cache/nginx    # microcache survives a container restart
+      - nginx_certs:/etc/nginx/certs    # self-signed cert, generated on first start
+    depends_on:
+      # Nginx resolves the upstream hostnames api1/api2/api3 ONCE, at start-up,
+      # and REFUSES TO START if any of them is unknown ("host not found in
+      # upstream"). So the dependency is not politeness -- without it, a cold
+      # `docker compose up` would crash Nginx roughly half the time.
+      #
+      # (This is also the standard gotcha with Nginx and dynamic backends: in
+      # production, upstreams that come and go need either a `resolver` plus a
+      # variable in proxy_pass, or service discovery that rewrites the config.)
+      - api1
+      - api2
+      - api3
+    restart: unless-stopped
+    networks: [seatrush]
+
+  # -----------------------------------------------------------------------
+  # Flash-sale load generator. Behind a profile so a normal `docker compose up`
+  # never starts it:
+  #     docker compose --profile tools run --rm loadtest --mode direct
+  loadtest:
+    build:
+      context: ./loadtest
+      dockerfile: Dockerfile
+    profiles: ["tools"]
+    environment:
+      # `direct` mode talks straight to the replicas on the private network,
+      # bypassing Nginx's rate limits, to put maximum contention on Postgres.
+      ADMIN_EMAIL: admin@seatrush.dev
+      ADMIN_PASSWORD: admin123
+      JWT_SECRET: dev-only-insecure-jwt-secret-change-me
+      DIRECT_TARGETS: http://api1:8000,http://api2:8000,http://api3:8000
+      EDGE_BASE: https://nginx:443
+    depends_on:
+      - api1
+      - api2
+      - api3
+    networks: [seatrush]
+
+volumes:
+  pg_data:
+  nginx_logs:
+  nginx_cache:
+  nginx_certs:
+
+networks:
+  seatrush:
+    driver: bridge
