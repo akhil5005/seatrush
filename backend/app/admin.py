@@ -133,6 +133,33 @@ async def reset_event(event_id: int, _admin: User = Depends(current_admin)):
     }
 
 
+@router.get("/loadtest-users")
+async def loadtest_users(limit: int = 300, _admin: User = Depends(current_admin)):
+    """Ids of the seeded ltNNN@seatrush.dev fixtures. DEMO TOOLING ONLY.
+
+    Why this exists: loadtest/flashsale.py needs to act as hundreds of distinct
+    users. Logging each one in would hit Nginx's login rate limit (5r/m per IP)
+    within seconds and measure the rate limiter instead of the booking logic.
+    So the load test mints its own JWTs with the dev secret -- and to do that it
+    needs the real `sub` (user id) for each fixture account, because holds.user_id
+    is a foreign key to a row that must actually exist.
+
+    Scoped to the lt% fixtures on purpose: it can never return a real user, and
+    it returns no password hashes. In production this endpoint would not ship --
+    it exists so the load test does not need database credentials of its own.
+    """
+    rows = await db.pool().fetch(
+        """
+        SELECT id, email FROM users
+         WHERE email LIKE 'lt%@seatrush.dev' AND role = 'user'
+         ORDER BY email
+         LIMIT $1
+        """,
+        max(1, min(limit, 2000)),
+    )
+    return {"users": [{"id": r["id"], "email": r["email"]} for r in rows]}
+
+
 @router.get("/events/{event_id}/stats")
 async def event_stats(event_id: int, _admin: User = Depends(current_admin)):
     """Live counters plus the integrity check the load test asserts on.

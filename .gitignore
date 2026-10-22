@@ -19,3 +19,7 @@ nginx/certs/
 
 # Captured run output used to fill in docs/interview-guide.html
 runs/
+
+.verify-tmp/
+.verify-big.json
+.verify-reload
