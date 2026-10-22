@@ -1,0 +1,33 @@
+# Optional Render Blueprint. You can equally click through the dashboard:
+#   New -> Web Service -> Docker -> Dockerfile path deploy/render/Dockerfile,
+#   Docker build context .
+#
+# Check the CURRENT free-tier limits before relying on this. Historically:
+# free Postgres instances expire after a fixed period and have a small storage
+# quota, and a free web service sleeps after inactivity (expect a cold start of
+# up to a minute) and gives you NO SHELL -- so the failover demo must be done
+# in Plan A.
+services:
+  - type: web
+    name: seatrush
+    runtime: docker
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: seatrush-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true        # a real secret, not the dev default
+      - key: HOLD_SECONDS
+        value: "300"
+      - key: MAX_SEATS_PER_HOLD
+        value: "6"
+
+databases:
+  - name: seatrush-db
+    plan: free
+    postgresMajorVersion: "16"

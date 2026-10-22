@@ -1,0 +1,302 @@
+# ===========================================================================
+#  SeatRush -- Nginx config for Plan B (Render)
+#
+#  This is the Plan A config with FOUR deliberate differences. Everything else
+#  -- rate limiting, microcaching, security headers, logging, the error
+#  envelope -- is identical, on purpose: the point of Plan B is to prove the
+#  design survives a different deployment shape, not to become a different app.
+#
+#  THE FOUR DIFFERENCES
+#   1. upstream points at 127.0.0.1:8001/8002/8003, because Render runs ONE
+#      container, so the "replicas" are three uvicorn PROCESSES, not hosts.
+#   2. `listen ${PORT};` -- Render assigns the port at runtime.
+#   3. No TLS block and no HTTP->HTTPS redirect: Render terminates HTTPS at its
+#      edge and hands us plain HTTP. Keeping our own ssl_certificate here would
+#      be wrong and would not even have a certificate to point at.
+#   4. real_ip_* so the per-IP rate limits see the actual visitor rather than
+#      Render's proxy.
+#
+#  *** THIS FILE IS A TEMPLATE, RENDERED BY envsubst '${PORT}' ***
+#  The quoted argument is load-bearing. `envsubst` with NO argument substitutes
+#  EVERY $name it finds -- which would eat $host, $remote_addr, $upstream_addr,
+#  $binary_remote_addr and every other NGINX variable below, replacing them
+#  with empty strings and producing a config that is silently, catastrophically
+#  broken (no real client IPs, no logging, rate limiting keyed on "").
+#  Restricting it to '${PORT}' is what keeps Nginx's own variables intact.
+#  See start.sh.
+# ===========================================================================
+
+worker_processes auto;
+error_log /dev/stderr warn;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    server_tokens off;
+
+    sendfile   on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+
+    client_max_body_size  64k;
+    client_header_timeout 10s;
+    client_body_timeout   10s;
+    large_client_header_buffers 4 16k;
+
+    # Writable paths: Render's filesystem is ephemeral and parts are read-only,
+    # so every temp path Nginx needs is pinned under /tmp.
+    client_body_temp_path /tmp/nginx_client_body;
+    proxy_temp_path       /tmp/nginx_proxy;
+    fastcgi_temp_path     /tmp/nginx_fastcgi;
+    uwsgi_temp_path       /tmp/nginx_uwsgi;
+    scgi_temp_path        /tmp/nginx_scgi;
+
+    # -----------------------------------------------------------------------
+    # DIFFERENCE 4: see the REAL client, not Render's proxy
+    # -----------------------------------------------------------------------
+    # Behind Render's load balancer every request arrives from Render's own
+    # IP. Without these three lines $remote_addr is that proxy address, so
+    # EVERY VISITOR ON EARTH SHARES ONE RATE-LIMIT BUCKET -- the per-IP zones
+    # would throttle the whole world together and the login limiter would lock
+    # out all users after five attempts total.
+    #
+    # THE TRADE-OFF, stated plainly: X-Forwarded-For is a client-supplied
+    # header. Anyone can send one. `set_real_ip_from` is what makes this safe:
+    # Nginx only rewrites $remote_addr when the request actually arrived from a
+    # trusted address. Set it to Render's egress range -- NEVER to 0.0.0.0/0,
+    # which would let any visitor spoof their IP and walk straight past the
+    # rate limiter.
+    #
+    # real_ip_recursive on: walk right-to-left through the XFF chain and take
+    # the first address that is NOT trusted, i.e. the real client.
+    set_real_ip_from  10.0.0.0/8;
+    set_real_ip_from  172.16.0.0/12;
+    set_real_ip_from  192.168.0.0/16;
+    real_ip_header    X-Forwarded-For;
+    real_ip_recursive on;
+
+    log_format json_combined escape=json
+        '{'
+          '"time":"$time_iso8601",'
+          '"remote_addr":"$remote_addr",'
+          '"request_method":"$request_method",'
+          '"request_uri":"$request_uri",'
+          '"status":$status,'
+          '"request_time":$request_time,'
+          '"upstream_addr":"$upstream_addr",'
+          '"upstream_status":"$upstream_status",'
+          '"upstream_response_time":"$upstream_response_time",'
+          '"upstream_cache_status":"$upstream_cache_status",'
+          '"body_bytes_sent":$body_bytes_sent,'
+          '"http_user_agent":"$http_user_agent"'
+        '}';
+
+    # On Render the log goes to stdout so it shows up in the dashboard, AND to
+    # the file the ops dashboard tails.
+    access_log /tmp/nginx-access.json.log json_combined buffer=32k flush=1s;
+
+    gzip              on;
+    gzip_comp_level   5;
+    gzip_min_length   256;
+    gzip_proxied      any;
+    gzip_types        application/json application/javascript text/javascript
+                      text/css text/plain text/xml application/xml
+                      image/svg+xml application/manifest+json;
+    gzip_vary         on;
+
+    # DIFFERENCE 3: Render terminates TLS, so $scheme here is "http" even
+    # though the user is on HTTPS. HSTS is therefore keyed on the forwarded
+    # proto instead -- and it is Render's certificate, a real one, so a long
+    # max-age is appropriate here in a way it never is on localhost.
+    map $http_x_forwarded_proto $hsts_header {
+        default "";
+        https   "max-age=31536000; includeSubDomains";
+    }
+
+    limit_req_zone $binary_remote_addr  zone=api_ip:10m        rate=20r/s;
+    limit_req_zone $binary_remote_addr  zone=auth_ip:10m       rate=5r/m;
+    limit_req_zone $http_authorization  zone=booking_user:10m  rate=2r/s;
+    limit_conn_zone $binary_remote_addr zone=conn_ip:10m;
+    limit_req_status  429;
+    limit_conn_status 429;
+    limit_req_log_level warn;
+
+    proxy_cache_path /tmp/nginx-cache
+                     levels=1:2
+                     keys_zone=api_cache:10m
+                     max_size=100m
+                     inactive=10m
+                     use_temp_path=off;
+
+    # -----------------------------------------------------------------------
+    # DIFFERENCE 1: three uvicorn PROCESSES on loopback, not three hosts
+    # -----------------------------------------------------------------------
+    # Same round robin, same passive failover, same keepalive pool. If one
+    # uvicorn process dies, Nginx routes around it exactly as in Plan A --
+    # which is the whole reason for running three processes instead of one
+    # here: the architecture stays honest.
+    upstream api_backend {
+        zone api_backend 64k;
+        server 127.0.0.1:8001 max_fails=2 fail_timeout=10s;
+        server 127.0.0.1:8002 max_fails=2 fail_timeout=10s;
+        server 127.0.0.1:8003 max_fails=2 fail_timeout=10s;
+        keepalive 32;
+        keepalive_requests 1000;
+        keepalive_timeout  60s;
+    }
+
+    proxy_next_upstream         error timeout http_502 http_503 http_504;
+    proxy_next_upstream_tries   3;
+    proxy_next_upstream_timeout 5s;
+
+    server {
+        # DIFFERENCE 2: Render assigns $PORT at runtime. This is the ONE
+        # variable envsubst is allowed to replace.
+        listen ${PORT} default_server;
+        server_name _;
+
+        root  /srv/www;
+        index index.html;
+
+        location /assets/ {
+            add_header Cache-Control "public, max-age=31536000, immutable" always;
+            include /etc/nginx/snippets/security-headers.conf;
+            access_log off;
+            try_files $uri =404;
+        }
+
+        location = /index.html {
+            add_header Cache-Control "no-cache" always;
+            include /etc/nginx/snippets/security-headers.conf;
+        }
+
+        location / {
+            include /etc/nginx/snippets/security-headers.conf;
+            try_files $uri $uri/ /index.html;
+        }
+
+        location ~ ^/api/events/[0-9]+/seats$ {
+            limit_req  zone=api_ip burst=40 nodelay;
+            limit_conn conn_ip 50;
+            proxy_cache       api_cache;
+            proxy_cache_valid 200 1s;
+            proxy_cache_methods GET HEAD;
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 2s;
+            proxy_cache_use_stale updating error timeout http_502 http_503;
+            proxy_cache_background_update on;
+            add_header X-Cache-Status $upstream_cache_status always;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        location = /api/events {
+            limit_req  zone=api_ip burst=40 nodelay;
+            limit_conn conn_ip 50;
+            proxy_cache       api_cache;
+            proxy_cache_valid 200 2s;
+            proxy_cache_methods GET HEAD;
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 2s;
+            proxy_cache_use_stale updating error timeout http_502 http_503;
+            proxy_cache_background_update on;
+            add_header X-Cache-Status $upstream_cache_status always;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        location ~ ^/api/events/[0-9]+$ {
+            limit_req  zone=api_ip burst=40 nodelay;
+            limit_conn conn_ip 50;
+            proxy_cache       api_cache;
+            proxy_cache_valid 200 2s;
+            proxy_cache_methods GET HEAD;
+            proxy_cache_lock on;
+            proxy_cache_lock_timeout 2s;
+            proxy_cache_use_stale updating error timeout http_502 http_503;
+            proxy_cache_background_update on;
+            add_header X-Cache-Status $upstream_cache_status always;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        location = /api/auth/login {
+            limit_req  zone=auth_ip burst=3 nodelay;
+            limit_req  zone=api_ip  burst=40 nodelay;
+            limit_conn conn_ip 50;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        location = /api/auth/signup {
+            limit_req  zone=auth_ip burst=3 nodelay;
+            limit_req  zone=api_ip  burst=40 nodelay;
+            limit_conn conn_ip 50;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        location /api/holds {
+            limit_req  zone=booking_user burst=5 nodelay;
+            limit_req  zone=api_ip       burst=40 nodelay;
+            limit_conn conn_ip 50;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        # Public on Render only because there is no other way to demo it.
+        # Restrict or remove for anything real.
+        location = /nginx_status {
+            stub_status;
+            access_log off;
+            include /etc/nginx/snippets/security-headers.conf;
+        }
+
+        location /api/ {
+            limit_req  zone=api_ip burst=40 nodelay;
+            limit_conn conn_ip 50;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/proxy-headers.conf;
+            proxy_pass http://api_backend;
+        }
+
+        error_page 429 = @rate_limited;
+        error_page 413 = @too_large;
+        error_page 502 503 504 = @upstream_down;
+
+        location @rate_limited {
+            default_type application/json;
+            add_header Retry-After 1 always;
+            add_header Cache-Control "no-store" always;
+            include /etc/nginx/snippets/security-headers.conf;
+            return 429 '{"error":{"code":"rate_limited","message":"Too many requests, please slow down","retry_after":1}}';
+        }
+
+        location @too_large {
+            default_type application/json;
+            add_header Cache-Control "no-store" always;
+            include /etc/nginx/snippets/security-headers.conf;
+            return 413 '{"error":{"code":"payload_too_large","message":"Request body exceeds the 64 KB limit"}}';
+        }
+
+        location @upstream_down {
+            default_type application/json;
+            add_header Retry-After 5 always;
+            add_header Cache-Control "no-store" always;
+            include /etc/nginx/snippets/security-headers.conf;
+            return 503 '{"error":{"code":"upstream_unavailable","message":"The booking service is temporarily unavailable"}}';
+        }
+    }
+}
