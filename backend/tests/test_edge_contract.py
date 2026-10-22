@@ -55,6 +55,21 @@ async def test_every_error_uses_the_same_envelope(client, user_token, pool):
         assert isinstance(body["error"]["code"], str)
 
 
+async def test_framework_errors_use_the_envelope_too(client):
+    """404 and 405 are produced by Starlette's ROUTER, before any of our
+    handlers run, and its default body is {"detail": ...} -- a second error
+    shape. Caught during edge verification: GET /api/nope returned
+    {"detail":"Not Found"}."""
+    missing = await client.get("/api/nope-does-not-exist")
+    assert missing.status_code == 404
+    assert missing.json() == {"error": {"code": "not_found", "message": "Not Found"}}
+
+    wrong_method = await client.delete("/api/events")
+    assert wrong_method.status_code == 405
+    assert set(wrong_method.json()) == {"error"}
+    assert wrong_method.json()["error"]["code"] == "method_not_allowed"
+
+
 async def test_api_prefix_is_never_stripped(client):
     """Every route lives under /api, which is what lets nginx.conf use
     `proxy_pass http://api_backend;` with NO trailing slash and no rewrite.

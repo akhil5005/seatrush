@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import admin, auth, bookings, config, db, events, holds, ops
 from .errors import ApiError, api_error_handler, unhandled_handler
@@ -78,6 +79,31 @@ async def validation_handler(_request: Request, exc: RequestValidationError):
             "code": "invalid_request",
             "message": f"{field}: {first.get('msg', 'invalid value')}",
         }},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(_request: Request, exc: StarletteHTTPException):
+    """Reshape the errors raised by the FRAMEWORK, not by our code.
+
+    An unmatched path or a wrong HTTP method is produced by Starlette's router
+    before any of our handlers run, and its default body is
+    {"detail": "Not Found"} -- a second, different error shape.
+    Nginx's own 429/413/503 pages are hand-written to match our envelope, so
+    letting this one through would mean the frontend needs two error parsers
+    and would mis-read a 404 or a 405. Caught while verifying the edge:
+    GET /api/nope returned {"detail":"Not Found"}.
+    """
+    code = {
+        404: "not_found",
+        405: "method_not_allowed",
+        401: "unauthorized",
+        403: "forbidden",
+    }.get(exc.status_code, "http_error")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": code, "message": str(exc.detail)}},
+        headers=getattr(exc, "headers", None) or {},
     )
 
 
